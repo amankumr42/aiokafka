@@ -1,5 +1,5 @@
 from kafka.errors import *  # noqa
-from kafka.errors import KafkaError
+from kafka.errors import KafkaError, InvalidMessageError
 
 __all__ = [
     # kafka-python errors
@@ -12,11 +12,14 @@ __all__ = [
     "RebalanceInProgressError", "IllegalGenerationError",
     "UnknownMemberIdError", "GroupLoadInProgressError",
     "GroupCoordinatorNotAvailableError", "NotCoordinatorForGroupError",
-    "GroupAuthorizationFailedError",
+    "GroupAuthorizationFailedError", "IllegalStateError",
+    "UnsupportedVersionError", "CorruptRecordException", "InvalidMessageError",
     # aiokafka custom errors
     "ConsumerStoppedError", "NoOffsetForPartitionError", "RecordTooLargeError",
     "ProducerClosed"
 ]
+
+CorruptRecordException = InvalidMessageError
 
 
 class ConsumerStoppedError(Exception):

@@ -3,15 +3,18 @@ import logging
 import collections
 
 from kafka.partitioner.default import DefaultPartitioner
-from kafka.protocol.message import Message, MessageSet
 from kafka.protocol.produce import ProduceRequest
+from kafka.codec import has_gzip, has_snappy, has_lz4
 
 import aiokafka.errors as Errors
-from aiokafka import ensure_future
 from aiokafka.client import AIOKafkaClient
-from aiokafka.errors import MessageSizeTooLargeError, KafkaError
-from aiokafka.message_accumulator import MessageAccumulator
+from aiokafka.errors import (
+    MessageSizeTooLargeError, KafkaError, UnknownTopicOrPartitionError)
+from aiokafka.record.legacy_records import LegacyRecordBatchBuilder
 from aiokafka.structs import TopicPartition
+from aiokafka.util import ensure_future
+
+from .message_accumulator import MessageAccumulator
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +136,12 @@ class AIOKafkaProducer(object):
     """
     _PRODUCER_CLIENT_ID_SEQUENCE = 0
 
+    _COMPRESSORS = {
+        'gzip': (has_gzip, LegacyRecordBatchBuilder.CODEC_GZIP),
+        'snappy': (has_snappy, LegacyRecordBatchBuilder.CODEC_SNAPPY),
+        'lz4': (has_lz4, LegacyRecordBatchBuilder.CODEC_LZ4),
+    }
+
     def __init__(self, *, loop, bootstrap_servers='localhost',
                  client_id=None,
                  metadata_max_age_ms=300000, request_timeout_ms=40000,
@@ -147,6 +156,14 @@ class AIOKafkaProducer(object):
             raise ValueError("Invalid ACKS parameter")
         if compression_type not in ('gzip', 'snappy', 'lz4', None):
             raise ValueError("Invalid compression type!")
+        if compression_type:
+            checker, compression_attrs = self._COMPRESSORS[compression_type]
+            if not checker():
+                raise RuntimeError("Compression library for {} not found"
+                                   .format(compression_type))
+        else:
+            compression_attrs = 0
+
         if api_version not in (
                 'auto', '0.10', '0.9', '0.8.2', '0.8.1', '0.8.0'):
             raise ValueError("Unsupported Kafka version")
@@ -175,7 +192,7 @@ class AIOKafkaProducer(object):
             ssl_context=ssl_context)
         self._metadata = self.client.cluster
         self._message_accumulator = MessageAccumulator(
-            self._metadata, max_batch_size, self._compression_type,
+            self._metadata, max_batch_size, compression_attrs,
             self._request_timeout_ms / 1000, loop)
         self._sender_task = None
         self._in_flight = set()
@@ -183,6 +200,7 @@ class AIOKafkaProducer(object):
         self._loop = loop
         self._retry_backoff = retry_backoff_ms / 1000
         self._linger_time = linger_ms / 1000
+        self._producer_magic = 0
 
     @asyncio.coroutine
     def start(self):
@@ -197,15 +215,21 @@ class AIOKafkaProducer(object):
         self._sender_task = ensure_future(
             self._sender_routine(), loop=self._loop)
         self._message_accumulator.set_api_version(self.client.api_version)
+        self._producer_magic = 0 if self.client.api_version < (0, 10) else 1
         log.debug("Kafka producer started")
+
+    @asyncio.coroutine
+    def flush(self):
+        """Wait untill all batches are Delivered and futures resolved"""
+        yield from self._message_accumulator.flush()
 
     @asyncio.coroutine
     def stop(self):
         """Flush all pending data and close all connections to kafka cluster"""
         if self._closed:
             return
+        self._closed = True
 
-        # Wait untill all batches are Delivered and futures resolved
         yield from self._message_accumulator.close()
 
         if self._sender_task:
@@ -213,7 +237,6 @@ class AIOKafkaProducer(object):
             yield from self._sender_task
 
         yield from self.client.close()
-        self._closed = True
         log.debug("The Kafka producer has closed.")
 
     @asyncio.coroutine
@@ -222,7 +245,8 @@ class AIOKafkaProducer(object):
         return (yield from self.client._wait_on_metadata(topic))
 
     @asyncio.coroutine
-    def send(self, topic, value=None, key=None, partition=None):
+    def send(self, topic, value=None, key=None, partition=None,
+             timestamp_ms=None):
         """Publish a message to a topic.
 
         Arguments:
@@ -243,6 +267,8 @@ class AIOKafkaProducer(object):
                 partition (but if key is None, partition is chosen randomly).
                 Must be type bytes, or be serializable to bytes via configured
                 key_serializer.
+            timestamp_ms (int, optional): epoch milliseconds (from Jan 1 1970
+                UTC) to use as the message timestamp. Defaults to current time.
 
         Returns:
             asyncio.Future: object that will be set when message is
@@ -275,18 +301,36 @@ class AIOKafkaProducer(object):
         log.debug("Sending (key=%s value=%s) to %s", key, value, tp)
 
         fut = yield from self._message_accumulator.add_message(
-            tp, key_bytes, value_bytes, self._request_timeout_ms / 1000)
+            tp, key_bytes, value_bytes, self._request_timeout_ms / 1000,
+            timestamp_ms=timestamp_ms)
         return fut
 
     @asyncio.coroutine
-    def send_and_wait(self, topic, value=None, key=None, partition=None):
+    def send_and_wait(self, topic, value=None, key=None, partition=None,
+                      timestamp_ms=None):
         """Publish a message to a topic and wait the result"""
-        future = yield from self.send(topic, value, key, partition)
+        future = yield from self.send(
+            topic, value, key, partition, timestamp_ms)
         return (yield from future)
 
     @asyncio.coroutine
     def _sender_routine(self):
-        """backgroud task that sends message batches to Kafka brokers"""
+        """ Background task, that sends pending batches to leader nodes for
+        batch's partition. This incapsulates same logic as Java's `Sender`
+        background thread. Because we use asyncio this is more event based
+        loop, rather than counting timeout till next possible even like in
+        Java.
+
+            The procedure:
+            * Group pending batches by partition leaders (write nodes)
+            * Ignore not ready (disconnected) and nodes, that already have a
+              pending request.
+            * If we have unknown leaders for partitions, we request a metadata
+              update.
+            * Wait for any event, that can change the above procedure, like
+              new metadata or pending send is finished and a new one can be
+              done.
+        """
         tasks = set()
         try:
             while True:
@@ -299,14 +343,13 @@ class AIOKafkaProducer(object):
                     task = ensure_future(
                         self._send_produce_req(node_id, batches),
                         loop=self._loop)
+                    self._in_flight.add(node_id)
                     tasks.add(task)
 
                 if unknown_leaders_exist:
                     # we have at least one unknown partition's leader,
                     # try to update cluster metadata and wait backoff time
-                    self.client.force_metadata_update()
-                    # Just to have at least 1 future in wait() call
-                    fut = asyncio.sleep(self._retry_backoff, loop=self._loop)
+                    fut = self.client.force_metadata_update()
                     waiters = tasks.union([fut])
                 else:
                     fut = self._message_accumulator.data_waiter()
@@ -320,16 +363,24 @@ class AIOKafkaProducer(object):
                     waiters,
                     return_when=asyncio.FIRST_COMPLETED,
                     loop=self._loop)
+
+                # done tasks should never produce errors, if they are it's a
+                # bug
+                for task in done:
+                    task.result()
+
                 tasks -= done
 
         except asyncio.CancelledError:
-            pass
+            # done tasks should never produce errors, if they are it's a bug
+            for task in tasks:
+                yield from task
         except Exception:  # pragma: no cover
             log.error("Unexpected error in sender routine", exc_info=True)
 
     @asyncio.coroutine
     def _send_produce_req(self, node_id, batches):
-        """Create produce request to node
+        """ Create produce request to node
         If producer configured with `retries`>0 and produce response contain
         "failed" partitions produce request for this partition will try
         resend to broker `retries` times with `retry_timeout_ms` timeouts.
@@ -338,50 +389,55 @@ class AIOKafkaProducer(object):
             node_id (int): kafka broker identifier
             batches (dict): dictionary of {TopicPartition: MessageBatch}
         """
-        self._in_flight.add(node_id)
         t0 = self._loop.time()
-        while True:
-            topics = collections.defaultdict(list)
-            for tp, batch in batches.items():
-                topics[tp.topic].append(
-                    (tp.partition, batch.get_data_buffer())
-                )
 
-            if self.client.api_version >= (0, 10):
-                version = 2
-            elif self.client.api_version == (0, 9):
-                version = 1
-            else:
-                version = 0
+        topics = collections.defaultdict(list)
+        for tp, batch in batches.items():
+            topics[tp.topic].append(
+                (tp.partition, batch.get_data_buffer())
+            )
 
-            request = ProduceRequest[version](
-                required_acks=self._acks,
-                timeout=self._request_timeout_ms,
-                topics=list(topics.items()))
+        if self.client.api_version >= (0, 10):
+            version = 2
+        elif self.client.api_version == (0, 9):
+            version = 1
+        else:
+            version = 0
 
-            try:
-                response = yield from self.client.send(node_id, request)
-            except KafkaError as err:
+        request = ProduceRequest[version](
+            required_acks=self._acks,
+            timeout=self._request_timeout_ms,
+            topics=list(topics.items()))
+
+        reenqueue = []
+        try:
+            response = yield from self.client.send(node_id, request)
+        except KafkaError as err:
+            log.warning(
+                "Got error produce response: %s", err)
+            if getattr(err, "invalid_metadata", False):
+                self.client.force_metadata_update()
+
+            for batch in batches.values():
+                if not self._can_retry(err, batch):
+                    batch.failure(exception=err)
+                else:
+                    reenqueue.append(batch)
+        else:
+            # noacks, just mark batches as "done"
+            if request.required_acks == 0:
                 for batch in batches.values():
-                    if not err.retriable or batch.expired():
-                        batch.done(exception=err)
-                log.warning(
-                    "Got error produce response: %s", err)
-                if not err.retriable:
-                    break
+                    batch.done_noack()
             else:
-                if response is None:
-                    # noacks, just "done" batches
-                    for batch in batches.values():
-                        batch.done()
-                    break
-
                 for topic, partitions in response.topics:
                     for partition_info in partitions:
                         if response.API_VERSION < 2:
                             partition, error_code, offset = partition_info
+                            # Mimic CREATE_TIME to take user provided timestamp
+                            timestamp = -1
                         else:
-                            partition, error_code, offset, _ = partition_info
+                            partition, error_code, offset, timestamp = \
+                                partition_info
                         tp = TopicPartition(topic, partition)
                         error = Errors.for_code(error_code)
                         batch = batches.pop(tp, None)
@@ -389,22 +445,27 @@ class AIOKafkaProducer(object):
                             continue
 
                         if error is Errors.NoError:
-                            batch.done(offset)
-                        elif not getattr(error, 'retriable', False) or \
-                                batch.expired():
-                            batch.done(exception=error())
+                            batch.done(offset, timestamp)
+                        elif not self._can_retry(error(), batch):
+                            batch.failure(exception=error())
                         else:
-                            # Ok, we can retry this batch
-                            batches[tp] = batch
                             log.warning(
                                 "Got error produce response on topic-partition"
                                 " %s, retrying. Error: %s", tp, error)
+                            # Ok, we can retry this batch
+                            if getattr(error, "invalid_metadata", False):
+                                self.client.force_metadata_update()
+                            reenqueue.append(batch)
 
-            if batches:
-                yield from asyncio.sleep(
-                    self._retry_backoff, loop=self._loop)
-            else:
-                break
+        if reenqueue:
+            # Wait backoff before reequeue
+            yield from asyncio.sleep(self._retry_backoff, loop=self._loop)
+
+            for batch in reenqueue:
+                self._message_accumulator.reenqueue(batch)
+            # If some error started metadata refresh we have to wait before
+            # trying again
+            yield from self.client._maybe_wait_metadata()
 
         # if batches for node is processed in less than a linger seconds
         # then waiting for the remaining time
@@ -413,6 +474,16 @@ class AIOKafkaProducer(object):
             yield from asyncio.sleep(sleep_time, loop=self._loop)
 
         self._in_flight.remove(node_id)
+
+    def _can_retry(self, error, batch):
+        if batch.expired():
+            return False
+        # XXX: remove unknown topic check as we fix
+        #      https://github.com/dpkp/kafka-python/issues/1155
+        if error.retriable or isinstance(error, UnknownTopicOrPartitionError)\
+                or error is UnknownTopicOrPartitionError:
+            return True
+        return False
 
     def _serialize(self, topic, key, value):
         if self._key_serializer:
@@ -424,7 +495,8 @@ class AIOKafkaProducer(object):
         else:
             serialized_value = value
 
-        message_size = MessageSet.HEADER_SIZE + Message.HEADER_SIZE
+        message_size = LegacyRecordBatchBuilder.record_overhead(
+            self._producer_magic)
         if serialized_key is not None:
             message_size += len(serialized_key)
         if serialized_value is not None:
@@ -449,3 +521,33 @@ class AIOKafkaProducer(object):
         available = list(self._metadata.available_partitions_for_topic(topic))
         return self._partitioner(
             serialized_key, all_partitions, available)
+
+    def create_batch(self):
+        """Create and return an empty BatchBuilder.
+
+        The batch is not queued for send until submission to ``send_batch``.
+
+        Returns:
+            BatchBuilder: empty batch to be filled and submitted by the caller.
+        """
+        return self._message_accumulator.create_builder()
+
+    @asyncio.coroutine
+    def send_batch(self, batch, topic, *, partition):
+        """Submit a BatchBuilder for publication.
+
+        Arguments:
+            batch (BatchBuilder): batch object to be published.
+            topic (str): topic where the batch will be published.
+            partition (int): partition where this batch will be published.
+
+        Returns:
+            asyncio.Future: object that will be set when the batch is
+                delivered.
+        """
+        partition = self._partition(topic, partition, None, None, None, None)
+        tp = TopicPartition(topic, partition)
+        log.debug("Sending batch to %s", tp)
+        future = yield from self._message_accumulator.add_batch(
+            batch, tp, self._request_timeout_ms / 1000)
+        return future

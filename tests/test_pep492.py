@@ -45,7 +45,8 @@ class TestConsumerIteratorIntegration(KafkaIntegrationTestCase):
         await consumer.start()
 
         messages = []
-        with self.assertLogs('aiokafka.consumer', level='ERROR') as cm:
+        with self.assertLogs(
+                'aiokafka.consumer.consumer', level='ERROR') as cm:
             async for m in consumer:
                 messages.append(m)
                 if len(messages) == 2:
@@ -56,7 +57,7 @@ class TestConsumerIteratorIntegration(KafkaIntegrationTestCase):
 
             self.assertEqual(len(cm.output), 1)
             self.assertTrue(
-                'ERROR:aiokafka.consumer:error in consumer iterator'
+                'ERROR:aiokafka.consumer.consumer:error in consumer iterator'
                 in cm.output[0])
         self.assertEqual(messages[0].value, large_messages[0])
         self.assertEqual(messages[1].value, small_messages[0])
@@ -74,7 +75,7 @@ class TestConsumerIteratorIntegration(KafkaIntegrationTestCase):
 
         with self.assertRaises(OffsetOutOfRangeError):
             async for m in consumer:
-                print(m)  # pragma: no cover
+                m  # pragma: no cover
 
     @run_until_complete
     async def test_consumer_stops_iter(self):
