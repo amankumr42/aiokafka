@@ -250,16 +250,19 @@ class GroupCoordinator(BaseCoordinator):
         node_id = self.coordinator_id
         if node_id is None:
             raise Errors.GroupCoordinatorNotAvailableError()
-        try:
-            resp = yield from self._client.send(
-                node_id, request, group=ConnectionGroup.COORDINATION)
-        except Errors.KafkaError as err:
-            log.error(
-                'Error sending %s to node %s [%s] -- marking coordinator dead',
-                request.__class__.__name__, node_id, err)
-            self.coordinator_dead()
-            raise err
-        return resp
+        for i in range(100):
+            try:
+                resp = yield from self._client.send(
+                    node_id, request, group=ConnectionGroup.COORDINATION)
+                return resp
+            except Errors.NodeNotReadyError:
+                yield from asyncio.sleep(1)
+            except Errors.KafkaError as err:
+                log.error(
+                    'Error sending %s to node %s [%s] -- marking coordinator dead',
+                        request.__class__.__name__, node_id, err)
+                self.coordinator_dead()
+                raise err
 
     @asyncio.coroutine
     def close(self):
